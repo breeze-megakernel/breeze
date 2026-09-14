@@ -1,0 +1,100 @@
+--- a/src/modules/transport/ibrc/ibrc.cpp
++++ b/src/modules/transport/ibrc/ibrc.cpp
+@@ -1312,6 +1312,12 @@
+     NVSHMEMI_ERROR_EXIT("RMA/AMO verb %d not implemented\n", verb.desc);
+ 
+ post_op:
++    /* Breeze NIC-side ordering: consume a pending fence on the next signal/AMO
++     * by delegating the ordering to the NIC via IBV_SEND_FENCE. */
++    if (ep->common_ep.fence_pending > 0) {
++        sr->send_flags |= IBV_SEND_FENCE;
++        ep->common_ep.fence_pending--;
++    }
+     status = ibv_post_send(ep->qp, sr, bad_sr);
+     NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "ibv_post_send failed \n");
+ 
+--- a/src/modules/transport/common/transport_ib_common.cpp
++++ b/src/modules/transport/common/transport_ib_common.cpp
+@@ -184,6 +184,22 @@
+     return false;
+ }
+ 
++/* === Breeze: peer-hash QP routing + NIC flag fence === */
++/* Cached env lookup for NVSHMEM_IB_PEERHASH. Default: enabled.
++ * Set NVSHMEM_IB_PEERHASH=0 to fall back to stock round-robin routing
++ * and proxy-drain fence. */
++static int nvshmemt_ib_peer_hash_enabled(void) {
++    static int cached = -1;
++    if (cached < 0) {
++        const char *env = getenv("NVSHMEM_IB_PEERHASH");
++        cached = (env && env[0] == '0') ? 0 : 1;
++        fprintf(stderr, "[breeze] NVSHMEM_IB_PEERHASH=%s (peer-hash routing %s)\n",
++                env ? env : "(unset, default 1)",
++                cached ? "enabled" : "disabled");
++    }
++    return cached;
++}
++
+ int nvshmemt_ib_common_check_poll_avail(nvshmem_transport_t tcurr, nvshmemt_ib_common_ep_ptr_t ep,
+                                         nvshmemt_ib_wait_predicate_t wait_predicate) {
+     int status = 0;
+@@ -294,9 +310,25 @@
+     }
+ 
+     if (multiple_qps || is_multi) {
+-        /* Call quiet to ensure all operations complete before fencing */
+-        status = nvshmemt_ib_common_quiet(tcurr, pe, qp_index);
+-        NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "quiet failed \n");
++        /* === Breeze: peer-hash QP routing + NIC flag fence === */
++        if (nvshmemt_ib_peer_hash_enabled()) {
++            /* With peer-hash routing, all ops for peer `pe` go on one ep
++             * (the one hashed from pe). Record a pending fence on THAT ep
++             * only; the next signal/AMO on that ep picks up IBV_SEND_FENCE
++             * to order the signal behind prior PUTs on the same QP. */
++            int default_qp_count = ib_state->options->IB_NUM_RC_PER_DEVICE;
++            if (default_qp_count > 0) {
++                int selected_qp = 1 + (pe % default_qp_count);
++                nvshmemt_ib_common_ep_ptr_t ep_ptr = ib_state->ep[selected_qp * n_pes + pe];
++                if (ep_ptr) {
++                    ((struct nvshmemt_ib_common_ep *)ep_ptr)->fence_pending++;
++                }
++            }
++        } else {
++            /* Fallback: stock proxy drain. */
++            status = nvshmemt_ib_common_quiet(tcurr, pe, qp_index);
++            NVSHMEMI_NZ_ERROR_JMP(status, NVSHMEMX_ERROR_INTERNAL, out, "quiet failed \n");
++        }
+     }
+ 
+ out:
+@@ -454,8 +486,19 @@
+     if (qp_index == NVSHMEMX_QP_HOST) {
+         return ib_state->ep[ib_state->host_ep_index + pe_index];
+     } else if (qp_index == NVSHMEMX_QP_DEFAULT) {
+-        /* Round robin over default QPs */
++        /* === Breeze: peer-hash QP routing + NIC flag fence === */
++        /* Peer-hash routing: all ops for peer P go on a fixed ep
++         * (1 + pe_index % NUM_RC) so that intra-peer FIFO ordering
++         * guarantees PUT->SIGNAL ordering via IBV_SEND_FENCE. This is
++         * the key enabler for replacing fence=drain with fence=flag on
++         * multi-QP ibrc. Cross-peer traffic still spreads across QPs
++         * for bandwidth. Fallback to round-robin available via env. */
+         int default_qp_count = ib_state->options->IB_NUM_RC_PER_DEVICE;
++        if (nvshmemt_ib_peer_hash_enabled() && default_qp_count > 0) {
++            int selected_qp = 1 + (pe_index % default_qp_count);
++            return ib_state->ep[selected_qp * t->n_pes + pe_index];
++        }
++        /* Original round-robin path (NVSHMEM_IB_PEERHASH=0) */
+         int selected_qp = ib_state->cur_default_qp_index % (default_qp_count + 1);
+         assert(ib_state->cur_default_qp_index != NVSHMEMX_QP_HOST);
+         int next_qp_index = (ib_state->cur_default_qp_index + 1) % (default_qp_count + 1);
+--- a/src/modules/transport/common/transport_ib_common.h
++++ b/src/modules/transport/common/transport_ib_common.h
+@@ -55,6 +55,7 @@
+     volatile uint64_t head_op_id;
+     volatile uint64_t tail_op_id;
+     nvshmem_transport_t transport;
++    int fence_pending; /* count of pending fences; consumed by the next signal/AMO on this ep */
+ };
+ 
+ #ifndef MAX_NUM_PORTS

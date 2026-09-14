@@ -1,0 +1,68 @@
+--- a/src/modules/transport/libfabric/libfabric.cpp
++++ b/src/modules/transport/libfabric/libfabric.cpp
+@@ -411,6 +411,20 @@
+     return status;
+ }
+ 
++static int nvshmemt_libfabric_fence(struct nvshmem_transport *tcurr, int pe, int is_proxy) {
++    nvshmemt_libfabric_state_t *libfabric_state = (nvshmemt_libfabric_state_t *)tcurr->state;
++    nvshmemt_libfabric_endpoint_t *ep;
++
++    if (is_proxy) {
++        ep = &libfabric_state->eps[NVSHMEMT_LIBFABRIC_PROXY_EP_IDX];
++    } else {
++        ep = &libfabric_state->eps[NVSHMEMT_LIBFABRIC_HOST_EP_IDX];
++    }
++
++    ep->fence_pending = 1;
++    return 0;
++}
++
+ static int nvshmemt_libfabric_show_info(struct nvshmem_transport *transport, int style) {
+     NVSHMEMI_ERROR_PRINT("libfabric show info not implemented");
+     return 0;
+@@ -712,14 +726,22 @@
+     }
+ 
+     do {
++        uint64_t extra_flags = 0;
++        if (ep->fence_pending) {
++            extra_flags = FI_FENCE;
++            ep->fence_pending = 0;
++        }
++
+         if (verb.desc == NVSHMEMI_AMO_COMPARE_SWAP) {
+             status = fi_compare_atomicmsg(ep->endpoint, &amo_msg, &fi_comp_iov, NULL, 1,
+-                                          &fi_ret_iov, &local_handle->local_desc, 1, FI_INJECT);
++                                          &fi_ret_iov, &local_handle->local_desc, 1,
++                                          FI_INJECT | extra_flags);
+         } else if (verb.desc < NVSHMEMI_AMO_END_OF_NONFETCH) {
+-            status = fi_atomicmsg(ep->endpoint, &amo_msg, op == FI_ATOMIC_READ ? 0 : FI_INJECT);
++            status = fi_atomicmsg(ep->endpoint, &amo_msg,
++                                  (op == FI_ATOMIC_READ ? 0 : FI_INJECT) | extra_flags);
+         } else {
+             status = fi_fetch_atomicmsg(ep->endpoint, &amo_msg, &fi_ret_iov,
+-                                        &local_handle->local_desc, 1, FI_INJECT);
++                                        &local_handle->local_desc, 1, FI_INJECT | extra_flags);
+         }
+     } while (try_again(transport, &status, &num_retries));
+ 
+@@ -1673,7 +1695,7 @@
+     transport->host_ops.get_mem_handle = nvshmemt_libfabric_get_mem_handle;
+     transport->host_ops.release_mem_handle = nvshmemt_libfabric_release_mem_handle;
+     transport->host_ops.rma = nvshmemt_libfabric_rma;
+-    transport->host_ops.fence = nvshmemt_libfabric_quiet;
++    transport->host_ops.fence = nvshmemt_libfabric_fence;
+     transport->host_ops.quiet = nvshmemt_libfabric_quiet;
+     transport->host_ops.finalize = nvshmemt_libfabric_finalize;
+     transport->host_ops.show_info = nvshmemt_libfabric_show_info;
+--- a/src/modules/transport/libfabric/libfabric.h
++++ b/src/modules/transport/libfabric/libfabric.h
+@@ -57,6 +57,7 @@
+     struct fid_cq *cq;
+     struct fid_cntr *counter;
+     uint64_t submitted_ops;
++    int fence_pending;
+ } nvshmemt_libfabric_endpoint_t;
+ 
+ typedef enum {
