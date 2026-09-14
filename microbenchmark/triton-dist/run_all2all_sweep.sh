@@ -42,8 +42,6 @@ cd "$TRITON_DIST_SRC"
 #   M_LIST="1024 65536" bash run_all2all_sweep.sh
 M_LIST=${M_LIST:-"128 256 512 1024 2048 4096 8192 16384 32768 65536 131072 262144 524288 1048576 2097152"}
 
-# TODO(release): confirm -M/-N semantics in test_all_to_all.py and reconcile
-# with the the AllToAll sweep caption (H=2048) before publishing.
 for M in $M_LIST; do
   echo "==============================="
   echo "  M=$M"
